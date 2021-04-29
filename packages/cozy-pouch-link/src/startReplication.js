@@ -1,8 +1,11 @@
 import { default as helpers } from './helpers'
+import startsWith from 'lodash/startsWith'
+import generateReplicationId from 'pouchdb-generate-replication-id'
 import logger from './logger'
-
+import { fetchRemoteInstance } from './remote'
 const { isDesignDocument, isDeletedDocument } = helpers
-const humanTimeDelta = timeMs => {
+
+export const humanTimeDelta = timeMs => {
   let cur = timeMs
   let unitIndex = 0
   let str = ''
@@ -38,25 +41,44 @@ export const startReplication = (
 ) => {
   let replication
   const start = new Date()
-  const promise = new Promise((resolve, reject) => {
+  const promise = new Promise(async (resolve, reject) => {
     const url = getReplicationURL()
+    console.log('replication url : ', url)
     const {
       strategy,
+      initialReplication,
       warmupQueries,
+      filter,
       ...customReplicationOptions
     } = replicationOptions
     const options = {
-      batch_size: 1000, // we have mostly small documents
-      ...customReplicationOptions
+      batch_size: 1000 // we have mostly small documents
+      //...customReplicationOptions
     }
+    console.log('start replication with opts ', replicationOptions)
+    window.repOpts = options
+    window.customReplicationOptions = customReplicationOptions
     let replication
+    if (initialReplication && strategy !== 'toRemote') {
+      // For the first remote->local replication, we manually replicate all docs
+      // as it avoids to replicate all revs history
+      const start = new Date()
+      const docs = await replicateAllDocs(pouch, url)
+      const end = new Date()
+      console.log(
+        `PouchManager: init replication  took ${humanTimeDelta(
+          end - start
+        )} for ${docs.length} docs`
+      )
+      return resolve(docs)
+    }
+    console.log('go replication anyway ?!')
     if (strategy === 'fromRemote')
       replication = pouch.replicate.from(url, options)
     else if (strategy === 'toRemote')
       replication = pouch.replicate.to(url, options)
     else replication = pouch.sync(url, options)
 
-    // console.log('replication', replication)
     const docs = {}
 
     replication.on('change', infos => {
@@ -66,17 +88,25 @@ export const startReplication = (
       // See https://pouchdb.com/api.html#replication
       // and https://pouchdb.com/api.html#sync (see example response)
       const change = infos.change ? infos.change : infos
-
+      console.log('change : ', change)
       if (change.docs) {
         change.docs
           .filter(doc => !isDesignDocument(doc) && !isDeletedDocument(doc))
+          //.map(doc => (doc._revisions = manualRev(doc)))
           .forEach(doc => {
             docs[doc._id] = doc
           })
       }
     })
-    replication.on('error', reject).on('complete', () => {
+    replication.on('error', reject).on('complete', infos => {
+      console.log('PouchManager : replication infos : ', infos)
       const end = new Date()
+      console.log(
+        `PouchManager: replication console for ${url} took ${humanTimeDelta(
+          end - start
+        )} for ${infos.docs_written} docs`
+      )
+      console.log('actual saved docs : ', Object.keys(docs).length)
       if (process.env.NODE_ENV !== 'production') {
         logger.info(
           `PouchManager: replication for ${url} took ${humanTimeDelta(
@@ -97,3 +127,65 @@ export const startReplication = (
   promise.cancel = cancel
   return promise
 }
+
+const filterDocs = docs => {
+  return docs
+    .map(doc => doc.doc)
+    .filter(doc => !doc._deleted && !startsWith(doc._id, '_design'))
+}
+
+export const replicateAllDocs = async (db, baseUrl) => {
+  const remoteUrl = new URL(`${baseUrl}/_all_docs`)
+  const batchSize = 1000
+  let hasMore = true
+  let startDocId
+  let docs
+
+  while (hasMore) {
+    if (!startDocId) {
+      // first run
+      const res = await fetchRemoteInstance(remoteUrl, {
+        limit: batchSize,
+        include_docs: true
+      })
+      docs = filterDocs(res.rows)
+      console.log('res length: ', docs.length)
+      if (docs.length === 0) {
+        hasMore = false
+      } else {
+        startDocId = docs[docs.length - 1]._id
+        if (docs.length < batchSize) {
+          hasMore = false
+        }
+        const resInsert = await insertDocsBatch(db, docs)
+        console.log('res bulk insert : ', resInsert)
+      }
+    } else {
+      const res = await fetchRemoteInstance(remoteUrl, {
+        include_docs: true,
+        limit: batchSize,
+        startkey_docid: startDocId
+      })
+      const filteredDocs = filterDocs(res.rows)
+      console.log('res length: ', res.rows.length)
+      if (filteredDocs.length < 2) {
+        return docs
+      }
+      filteredDocs.shift() // Remove first element, already included in previous request
+      startDocId = filteredDocs[filteredDocs.length - 1]._id
+      await insertDocsBatch(db, filteredDocs)
+      docs = docs.concat(filteredDocs)
+      if (res.rows.length < batchSize) {
+        hasMore = false
+      }
+    }
+  }
+  console.log('docs retrieved : ', docs.length)
+  return docs
+}
+
+const insertDocsBatch = async (db, docs) => {
+  return db.bulkDocs(docs, { new_edits: false })
+}
+
+window.generateReplicationId = generateReplicationId

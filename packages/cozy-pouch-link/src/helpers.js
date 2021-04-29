@@ -1,9 +1,14 @@
 import startsWith from 'lodash/startsWith'
 
+//import pouchWorker from './pouchWorker.js'
+//const worker = new PouchWorker(PouchWorker)
+import { getDocs, ensureIndex } from './queries'
+import PouchWorker from 'worker-loader!./pouchWorker.js'
 const helpers = {}
 
+const worker = PouchWorker()
+
 // https://github.com/pouchdb/pouchdb/issues/7011
-const LIMIT_BUG = 999
 const ADAPTERS_WITH_LIMIT_BUG = ['cordova-sqlite', 'websql']
 
 helpers.isAdapterBugged = adapterName => {
@@ -20,38 +25,46 @@ helpers.withoutDesignDocuments = res => {
   }
 }
 
-helpers.getDocs = async (db, fct, options = {}) => {
-  // allDocs return an error when limit is null
-  if (options.limit === null) delete options.limit
+helpers.queryPouch = (db, query, options) =>
+  new Promise((resolve, reject) => {
+    const channel = new MessageChannel()
 
-  const limit = options.limit
-  const field = fct === 'allDocs' ? 'rows' : 'docs'
-
-  if (helpers.isAdapterBugged(db.adapter)) {
-    if (limit === undefined || limit > LIMIT_BUG) {
-      options.limit = LIMIT_BUG
-      options.skip = options.skip || 0
+    channel.port1.onmessage = ({ data }) => {
+      channel.port1.close()
+      if (data.error) {
+        reject(data.error)
+      } else {
+        resolve(data.result)
+      }
     }
-  }
-
-  const data = await db[fct](options)
-
-  if (data[field].length === options.limit) {
-    options.skip = (options.skip ? options.skip : 0) + options.limit
-    options.limit = limit ? limit - options.limit : undefined
-    if (options.limit > 0 || options.limit === undefined) {
-      const next = await helpers.getDocs(db, fct, options)
-
-      return { ...data, [field]: [...data[field], ...next[field]] }
+    const pouchOptions = {
+      adapter: db.adapter
     }
-  }
+    worker.postMessage(
+      {
+        dbName: db.name,
+        pouchOptions,
+        query,
+        options
+      },
+      [channel.port2]
+    )
+  })
 
-  return data
+helpers.createIndex = async (db, index) => {
+  console.log('lets create index : ', index)
+  //return helpers.queryPouch(db, 'createIndex', index)
+  return ensureIndex(db, index)
 }
 
-helpers.allDocs = async (db, options = {}) =>
-  helpers.getDocs(db, 'allDocs', options)
-helpers.find = async (db, options = {}) => helpers.getDocs(db, 'find', options)
+helpers.allDocs = async (db, options = {}) => {
+  //return helpers.queryPouch(db, 'allDocs', options)
+  return getDocs(db, 'allDocs', options)
+}
+helpers.find = async (db, options = {}) => {
+  //return helpers.queryPouch(db, 'find', options)
+  return getDocs(db, 'find', options)
+}
 
 helpers.isDesignDocument = doc => startsWith(doc._id, '_design')
 
